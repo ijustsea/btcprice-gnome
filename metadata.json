@@ -1,0 +1,10 @@
+{
+  "uuid": "btcprice-gnome@ijustsea.github.io",
+  "name": "BTC Price",
+  "description": "Bitcoin price from Coinbase in the top bar every 15 seconds, with Binance only as a fallback.",
+  "shell-version": [
+    "51"
+  ],
+  "version": 1,
+  "url": "https://github.com/ijustsea/btcprice-gnome"
+}
