@@ -10,14 +10,22 @@ const delay = controller => {
     assert(source, 'a read is scheduled');
     return (source.get_ready_time() - GLib.get_monotonic_time()) / 1e6;
 };
+// Failure logs are part of the behavior under test (once per failure streak), so they are captured.
+const warnings = [];
+GLib.log_set_writer_func((level, fields) => {
+    if (level !== GLib.LogLevelFlags.LEVEL_WARNING) return GLib.LogWriterOutput.UNHANDLED;
+    warnings.push(new TextDecoder().decode(fields.MESSAGE));
+    return GLib.LogWriterOutput.HANDLED;
+});
 const near = (actual, want, label) => assert(actual > want - 1.5 && actual <= want + 1, `${label}: ${actual.toFixed(1)}s, expected ${want}s`);
 
-function harness(answers) {
-    const h = {calls: [], views: [], answers};
+function harness(answers, initialQuote = null) {
+    const h = {calls: [], views: [], cancellables: [], answers};
     h.controller = new PriceController({
-        sources, now: () => 1000,
+        sources, now: () => 1000, initialQuote,
         fetchPrice: (url, cancellable) => {
             h.calls.push(url);
+            h.cancellables.push(cancellable);
             const answer = h.answers[url];
             if (answer === 'hang') return new Promise((_resolve, reject) => cancellable.connect(() => reject(new Error('cancelled'))));
             return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
@@ -75,6 +83,7 @@ const run = async () => {
     const stopped = harness({cb: 'hang'});
     stopped.controller.start(); const views = stopped.views.length;
     await tick(); stopped.controller.stop(); await tick();
+    assert(stopped.cancellables[0].is_cancelled(), 'stop cancels the request in flight');
     assert(stopped.views.length === views && stopped.controller.timer === 0, 'a read cancelled by stop publishes nothing and schedules nothing');
     // A stopped read that settles after a restart must not publish over the new one.
     const gates = [];
@@ -95,7 +104,40 @@ const run = async () => {
     await ui.controller.pending.catch(() => {});
     assert(ui.calls.join() === 'cb' && ui.controller.failures === 0, 'Binance is not asked and no backoff starts after a UI error');
     ui.controller.stop();
-    print('Controller GJS checks passed: Coinbase first, Binance fallback, backoff, recovery, coalescing, pause/resume, stop, restart guard, UI errors');
+
+    // After an unlock the new controller starts from the last price and keeps it if the network is not back yet.
+    const last = {source: 'coinbase', price: 61763.77, receivedAt: 1};
+    const unlock = harness({cb: new Error('offline'), bn: new Error('offline')}, last);
+    unlock.controller.start();
+    assert(unlock.views.length === 1 && unlock.views[0].quote === last && !unlock.views[0].failing && !unlock.views[0].paused,
+        'the last price is shown at once, before the first read');
+    await unlock.controller.pending;
+    assert(unlock.views.at(-1).quote === last && unlock.views.at(-1).failing, 'a failed first read keeps the last price, marked not live');
+    unlock.controller.stop();
+    const fresh = harness({cb: new Error('offline'), bn: new Error('offline')});
+    fresh.controller.start(); await fresh.controller.pending;
+    assert(fresh.views.length === 1 && fresh.views[0].quote === null && fresh.views[0].failing, 'without a last price only the failure is shown');
+    fresh.controller.stop();
+
+    // Each source's failure is logged once per streak, and a streak ends once that source is no longer needed.
+    warnings.length = 0;
+    const fallback = harness({cb: new Error('HTTP 503'), bn: 61725.04});
+    fallback.controller.start(); await fallback.controller.pending;
+    await fallback.controller.refresh(); await fallback.controller.refresh();
+    assert(warnings.length === 1 && /coinbase/.test(warnings[0]), 'Coinbase down for three polls while Binance answers logs once: ' + warnings);
+    fallback.controller.stop();
+    warnings.length = 0;
+    const logs = harness({cb: new Error('HTTP 503'), bn: new Error('offline')});
+    logs.controller.start(); await logs.controller.pending;
+    await logs.controller.refresh();
+    assert(warnings.length === 2 && /coinbase/.test(warnings[0]) && /binance/.test(warnings[1]), 'two sources failing twice log twice: ' + warnings);
+    logs.answers.cb = 61763.77;
+    await logs.controller.refresh();
+    logs.answers.cb = new Error('HTTP 503');
+    await logs.controller.refresh();
+    assert(warnings.length === 4 && /binance/.test(warnings[3]), 'a Binance failure after Coinbase recovered is a new streak: ' + warnings);
+    logs.controller.stop();
+    print('Controller GJS checks passed: Coinbase first, Binance fallback, backoff, recovery, coalescing, pause/resume, stop, restart guard, UI errors, unlock keeps the last price, failure logs');
 };
 const loop = new GLib.MainLoop(null, false);
 let failed = null;

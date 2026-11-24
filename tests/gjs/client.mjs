@@ -1,9 +1,21 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Soup from 'gi://Soup?version=3.0';
 import {PriceClient} from '../../build/client.js';
 
 const assert = (value, message) => { if (!value) throw new Error(message); };
+// No deadline timer or handler on the caller's cancellable may outlive a request, whatever its outcome.
+const deadlines = [];
+const timeoutAdd = GLib.timeout_add;
+GLib.timeout_add = (priority, interval, callback) => {
+    const id = timeoutAdd(priority, interval, callback);
+    if (interval === 10_000) deadlines.push(id);
+    return id;
+};
+const callers = [];
+const caller = () => { const cancellable = new Gio.Cancellable(); callers.push(cancellable); return cancellable; };
+const cancelled = GObject.signal_lookup('cancelled', Gio.Cancellable);
 // A real local HTTP server, so the client's Soup pipes, status handling and size bound are exercised.
 const server = new Soup.Server({});
 const routes = {
@@ -33,30 +45,34 @@ server.add_handler(null, (_server, message, path) => {
 server.listen_local(0, Soup.ServerListenOptions.IPV4_ONLY);
 const base = server.get_uris()[0].to_string().replace(/\/$/, '');
 const client = new PriceClient();
-const fails = async (path, cancellable = new Gio.Cancellable()) => {
+const fails = async (path, cancellable = caller()) => {
     try { await client.fetchPrice(base + path, cancellable); } catch (error) { return error; }
     return null;
 };
 
 const run = async () => {
-    assert(await client.fetchPrice(base + '/coinbase', new Gio.Cancellable()) === 61763.77, 'Coinbase body parsed');
-    assert(await client.fetchPrice(base + '/binance', new Gio.Cancellable()) === 61725.04, 'Binance body parsed');
+    assert(await client.fetchPrice(base + '/coinbase', caller()) === 61763.77, 'Coinbase body parsed');
+    assert(await client.fetchPrice(base + '/binance', caller()) === 61725.04, 'Binance body parsed');
     assert(ports.length === 2 && ports[0] === ports[1], 'consecutive healthy reads reuse one connection: ' + ports.join());
     assert((await fails('/error'))?.message.includes('HTTP 503'), 'HTTP errors reject with the status');
     assert(await fails('/html'), 'a non-JSON body rejects');
     assert((await fails('/big'))?.message.includes('exceeds'), 'an oversized body is rejected, not buffered');
-    assert(await client.fetchPrice(base + '/limit', new Gio.Cancellable()) === 61763.77, 'a body just under the bound is accepted');
-    const cancellable = new Gio.Cancellable();
+    assert(await client.fetchPrice(base + '/limit', caller()) === 61763.77, 'a body just under the bound is accepted');
+    const cancellable = caller();
     const pending = fails('/hang', cancellable);
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => { cancellable.cancel(); return GLib.SOURCE_REMOVE; });
     assert(await pending, 'cancellation rejects a hanging request');
-    const midBody = new Gio.Cancellable();
+    const midBody = caller();
     const stalled = fails('/stall', midBody);
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 150, () => { midBody.cancel(); return GLib.SOURCE_REMOVE; });
     const started = GLib.get_monotonic_time();
     assert(await stalled && GLib.get_monotonic_time() - started < 2e6, 'cancelling in the middle of a body rejects promptly');
+    assert(deadlines.length === callers.length && deadlines.every(id => !GLib.MainContext.default().find_source_by_id(id)),
+        `every request's deadline timer is gone once it settles (${deadlines.length} timers, ${callers.length} requests)`);
+    assert(callers.every(cancellable => !GObject.signal_has_handler_pending(cancellable, cancelled, 0, false)),
+        'no request leaves a handler on the caller\'s cancellable');
     client.close();
-    print('Client GJS checks passed: real HTTP pipes, both body shapes, status, non-JSON, 16 KiB bound, connection reuse, cancellation incl. mid-body');
+    print('Client GJS checks passed: real HTTP pipes, both body shapes, status, non-JSON, 16 KiB bound, connection reuse, cancellation incl. mid-body, no leftover timers or handlers');
 };
 const loop = new GLib.MainLoop(null, false);
 let failed = null;

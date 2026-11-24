@@ -16,10 +16,17 @@ test('both real response shapes parse to the price', () => {
     assert.equal(parsePrice('{"symbol":"BTCUSDT","price":"61725.04000000"}'), 61725.04);
 });
 
-test('anything but a positive decimal price string is rejected rather than shown', () => {
+test('anything but a decimal price string of at least 1 is rejected rather than shown', () => {
     for (const body of ['[]', 'null', '"61763"', '{}', '{"price":61763.77}', '{"price":"-1"}', '{"price":"0"}', '{"price":"0.0"}',
-        '{"price":"1e5"}', '{"price":" 61763"}', '{"price":"61,763"}', '{"price":"1234567890"}', '{"price":""}', 'not json'])
+        '{"price":"0.4"}', '{"price":"0.999999999999"}', '{"price":"1e5"}', '{"price":" 61763"}', '{"price":"61,763"}',
+        '{"price":"1234567890"}', '{"price":""}', 'not json'])
         assert.throws(() => parsePrice(body), body);
+    assert.equal(parsePrice('{"price":"1"}'), 1, 'the smallest accepted price');
+});
+
+test('server text in a rejected price stays on one log line', () => {
+    assert.throws(() => parsePrice('{"price":"61763\\nBTC Price: forged line"}'),
+        error => !error.message.includes('\n') && error.message.includes('\\n'));
 });
 
 test('prices round to whole dollars with thousands separators', () => {
@@ -52,6 +59,6 @@ test('menu status names the source, the time of the price and any retry or pause
     assert.match(statusText(view('coinbase', {paused: true, failing: true})), / · 자리 비움으로 일시정지$/);
 });
 
-test('polling is every 15 s and backs off only after every source failed', () => {
-    assert.deepEqual([0, 1, 2, 3, 4, 5, 6, 50].map(nextDelaySeconds), [15, 30, 60, 120, 240, 300, 300, 300]);
+test('polling is every 15 s and backs off to at most a minute only after every source failed', () => {
+    assert.deepEqual([0, 1, 2, 3, 4, 50, 5000].map(nextDelaySeconds), [15, 30, 60, 60, 60, 60, 60]);
 });

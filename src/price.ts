@@ -11,19 +11,25 @@ export const SOURCES: Source[] = [
 ];
 
 export const POLL_SECONDS = 15;
-/** Also not live: a price older than a minute, e.g. after a suspend delayed the next poll. */
+/** Longest wait after failures, so the price is live again about a minute after the network returns.
+ * Without a link requests fail locally; on a network that drops packets each source waits out the
+ * request deadline, still only one or two requests a minute. */
+export const MAX_RETRY_SECONDS = 60;
+/** Also not live: a price older than a minute, e.g. the last price shown again after an unlock. */
 export const STALE_MS = 60_000;
 
-/** Both endpoints answer {"price": "61763.77", ...}; anything else is rejected, never shown. */
+/** Both endpoints answer {"price": "61763.77", ...}; anything else is rejected, never shown.
+ * A price below 1 would display as $0, so it is treated as a bad answer, not a price. */
 export function parsePrice(body: string): number {
     const value: unknown = JSON.parse(body);
     if (!value || typeof value !== 'object' || Array.isArray(value))
         throw new Error('Price response is not a JSON object');
     const price = (value as Record<string, unknown>).price;
     if (typeof price !== 'string' || !/^\d{1,9}(?:\.\d{1,12})?$/.test(price))
-        throw new Error(`Unexpected price field: ${String(price).slice(0, 40)}`);
+        // Quoted, so server text cannot start a new log line.
+        throw new Error(`Unexpected price field: ${JSON.stringify(String(price).slice(0, 40))}`);
     const number = Number(price);
-    if (!(number > 0)) throw new Error(`Price is not positive: ${price}`);
+    if (!(number >= 1)) throw new Error(`Price is below 1: ${price}`);
     return number;
 }
 
@@ -53,7 +59,7 @@ export function statusText(view: PriceView): string {
     return `${source} · ${clock(quote.receivedAt)} 기준${state}`;
 }
 
-/** After every source failed: 30 s, 60 s, ... up to 5 min. A success returns to 15 s. */
+/** 15 s while healthy; after every source failed 30 s, then 60 s. A success returns to 15 s. */
 export function nextDelaySeconds(failures: number): number {
-    return failures === 0 ? POLL_SECONDS : Math.min(300, POLL_SECONDS * 2 ** Math.min(failures, 5));
+    return Math.min(MAX_RETRY_SECONDS, POLL_SECONDS * 2 ** failures);
 }

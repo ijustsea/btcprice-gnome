@@ -10,8 +10,8 @@ import type {Quote} from './price.js';
 // No keyboard or pointer input for this long pauses polling; any input resumes it at once.
 // Idle inhibitors are respected, so the price stays live while a video plays.
 const IDLE_PAUSE_MS = 5 * 60 * 1000;
-// Survives the disable/enable that GNOME performs around the lock screen, so unlocking shows
-// the last price (marked not live) instead of a blank until the first new read.
+// Survives the disable/enable that GNOME performs around the lock screen, so unlocking shows the
+// last price at once (marked not live when older than a minute) and keeps it if the first read fails.
 let lastQuote: Quote | null = null;
 const CHART_URL = 'https://www.tradingview.com/chart/?symbol=COINBASE%3ABTCUSD';
 
@@ -34,8 +34,8 @@ export default class BtcPriceExtension extends Extension {
         this.client = client;
         this.indicator = indicator;
         Main.panel.addToStatusArea(this.uuid, indicator.button);
-        if (lastQuote) indicator.update({quote: lastQuote, failing: false, paused: true}, Date.now());
         this.controller = new PriceController({
+            initialQuote: lastQuote,
             fetchPrice: (url, cancellable) => client.fetchPrice(url, cancellable),
             publish: view => { lastQuote = view.quote; this.indicator?.update(view, Date.now()); },
         });

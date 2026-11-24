@@ -7,11 +7,13 @@ interface Options {
     publish(view: PriceView): void;
     sources?: Source[];
     now?: () => number;
+    /** Kept until a new price arrives, e.g. the last price from before a lock-screen disable. */
+    initialQuote?: Quote | null;
 }
 
 /** Publishes only results, never an in-progress state, so the panel text does not flicker. */
 export class PriceController {
-    private quote: Quote | null = null;
+    private quote: Quote | null;
     private failures = 0;
     private failing = new Set<string>();
     private active = false;
@@ -21,12 +23,15 @@ export class PriceController {
     private pending: Promise<void> | null = null;
     private cancel: Gio.Cancellable | null = null;
 
-    constructor(private options: Options) {}
+    constructor(private options: Options) {
+        this.quote = options.initialQuote ?? null;
+    }
 
     start(): void {
         if (this.active) return;
         this.active = true;
         this.generation++;
+        if (this.quote) this.publish();
         if (!this.paused) void this.refresh();
     }
 
@@ -47,7 +52,8 @@ export class PriceController {
     }
 
     private async read(generation: number, cancel: Gio.Cancellable): Promise<void> {
-        for (const source of this.options.sources ?? SOURCES) {
+        const sources = this.options.sources ?? SOURCES;
+        for (const [index, source] of sources.entries()) {
             let price: number;
             try {
                 price = await this.options.fetchPrice(source.url, cancel);
@@ -59,7 +65,8 @@ export class PriceController {
                 continue;
             }
             if (generation !== this.generation) return;
-            this.failing.delete(source.id);
+            // Sources after this one were not needed, so their failure streaks end here too.
+            for (const {id} of sources.slice(index)) this.failing.delete(id);
             this.quote = {source: source.id, price, receivedAt: (this.options.now ?? Date.now)()};
             this.failures = 0;
             this.publish();

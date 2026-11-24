@@ -98,13 +98,21 @@ try {
     const afterDisable = {...counts};
     await sleep(1500);
     if (counts.coinbase !== afterDisable.coinbase || counts.binance !== afterDisable.binance) fail('Requests continued after disable', counts);
+    // Unlock while the network is still down: the last price must stay, marked not live.
+    await fetch(`${base}/mode?coinbase=fail&binance=fail`);
     call('org.gnome.Shell.Extensions.EnableExtension', meta.uuid);
-    await sleep(800);
+    let unlock = null;
+    for (let i = 0; i < 50 && !unlock; i++) { try { unlock = JSON.parse(await readFile(env.BTCPRICE_UI_REPORT + '.reenable', 'utf8')); } catch { await sleep(100); } }
+    if (unlock?.atEnable.text !== 'BTC $61,764' || unlock.afterRead.text !== 'BTC ~$61,764'
+        || !unlock.afterRead.status.startsWith('Coinbase') || !unlock.afterRead.status.includes('재시도'))
+        fail('After an offline unlock the last price must stay, marked not live', unlock);
     const after = call('org.gnome.Shell.Extensions.GetExtensionErrors', meta.uuid);
     if (!/\(\[\]|@as \[\]/.test(after)) fail('Re-enable errors', after);
-    if (counts.coinbase !== afterDisable.coinbase + 1) fail('Re-enable should read Coinbase once', counts);
+    if (counts.coinbase !== afterDisable.coinbase + 1 || counts.binance !== afterDisable.binance + 1)
+        fail('Re-enable should read Coinbase once, then Binance once', counts);
     console.log(`Panel ${report.first} (tabular widths ${report.widths.map(Math.round).join('/')}px), steady during refresh, fallback "${report.fallback.text}", all-fail backoff ${Math.round(report.allFail.delay)}s, recovery 15s, menu ${Math.round(report.menu.width)}x${Math.round(report.menu.height)}`);
-    console.log('Isolated GNOME Shell smoke passed: Coinbase first, Binance fallback, backoff, steady tabular panel, no requests after disable, clean re-enable.');
+    console.log(`Offline unlock keeps "${unlock.afterRead.text}" (${unlock.afterRead.status})`);
+    console.log('Isolated GNOME Shell smoke passed: Coinbase first, Binance fallback, backoff, steady tabular panel, no requests after disable, offline unlock keeps the last price.');
 } catch (error) {
     console.error(log);
     throw error;

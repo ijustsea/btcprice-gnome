@@ -11,12 +11,21 @@ if (probeBase) {
     probeSources[0].url = probeBase + '/coinbase';
     probeSources[1].url = probeBase + '/binance';
 }
+const probeWrite = (path, report) => ProbeGio.File.new_for_path(path).replace_contents(new TextEncoder().encode(JSON.stringify(report)),
+    null, false, ProbeGio.FileCreateFlags.PRIVATE, null);
 const probeEnable = BtcPriceExtension.prototype.enable;
 BtcPriceExtension.prototype.enable = function () {
     probeEnable.call(this);
     const extension = this;
     const reportPath = ProbeGLib.getenv('BTCPRICE_UI_REPORT');
-    if (!reportPath || extension.probed) return;
+    if (!reportPath) return;
+    if (extension.probed) {
+        // A later enable is the runner's lock/unlock: record the panel at once and after the first read.
+        const panel = () => ({text: extension.indicator.label.get_text(), status: extension.indicator.status.label.get_text()});
+        const atEnable = panel();
+        void extension.controller.pending.then(() => probeWrite(reportPath + '.reenable', {atEnable, afterRead: panel()}));
+        return;
+    }
     extension.probed = true;
     const session = new ProbeSoup.Session();
     const control = query => new Promise((resolve, reject) => session.send_and_read_async(
@@ -72,7 +81,6 @@ BtcPriceExtension.prototype.enable = function () {
         } catch (error) {
             report.error = `${error}\n${error.stack}`;
         }
-        ProbeGio.File.new_for_path(reportPath).replace_contents(new TextEncoder().encode(JSON.stringify(report)), null, false,
-            ProbeGio.FileCreateFlags.PRIVATE, null);
+        probeWrite(reportPath, report);
     })();
 };

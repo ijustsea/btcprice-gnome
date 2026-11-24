@@ -96,13 +96,13 @@ test('disable stops polling, closes the connection and removes the UI and every 
     assert.equal(controller.calls.at(-1), 'stop', 'late callbacks after disable do nothing');
 });
 
-test('after a lock-screen disable/enable the last price shows at once, marked not live', () => {
+test('after a lock-screen disable/enable the new controller starts from the last price', () => {
     const h = harness();
+    assert.equal(h.controller.options.initialQuote, null, 'nothing to show on the first enable');
     const quote = {source: 'coinbase', price: 61763.77, receivedAt: 1};
     h.controller.options.publish({quote, failing: false, paused: false});
     h.extension.disable();
-    h.view = null;
     h.extension.enable();
-    assert.deepEqual(h.view, {quote, failing: false, paused: true});
+    assert.deepEqual(h.controller.options.initialQuote, quote);
     h.extension.disable();
 });
