@@ -27,7 +27,28 @@ const plain = createServer((request, response) => {
 });
 const tls = createSecureServer({key, cert: readFileSync(cert), allowHTTP1: true}, (request, response) => {
     console.log(`${request.httpVersion} ${request.socket.remotePort} ${request.url}`);
-    if (request.url === '/redirect') {
+    if (request.url === '/rate-limited') {
+        response.writeHead(429, {'Retry-After': '120'}).end();
+    } else if (request.url === '/blocked') {
+        response.writeHead(418, {Date: 'Mon, 23 Nov 2026 17:27:00 GMT', 'Retry-After': 'Mon, 23 Nov 2026 17:31:00 GMT'}).end();
+    } else if (request.url === '/bad-retry-date') {
+        response.writeHead(503, {'Retry-After': 'next month'}).end();
+    } else if (request.url === '/retry-date-without-date-header') {
+        response.sendDate = false;
+        response.writeHead(503, {'Retry-After': 'Mon, 23 Nov 2026 17:31:00 GMT'}).end();
+    } else if (request.url === '/slow-trade') {
+        response.writeHead(200, {Date: 'Mon, 23 Nov 2026 17:27:16 GMT', 'content-type': 'application/json'});
+        response.write('{"price":"61763.77",');
+        const timer = setTimeout(() => response.end('"time":"2026-11-23T17:26:17Z"}'), 2150);
+        response.on('close', () => clearTimeout(timer));
+    } else if (request.url === '/old-trade') {
+        response.writeHead(200, {Date: 'Mon, 23 Nov 2026 17:27:16 GMT', Age: '60', 'content-type': 'application/json'});
+        response.end('{"price":"61763.77","time":"2026-11-23T17:27:15.491339698Z"}');
+    } else if (request.url === '/binance') {
+        response.writeHead(200, {'content-type': 'application/json'}).end('{"symbol":"BTCUSDT","price":"61725.04"}');
+    } else if (request.url === '/wrong-symbol') {
+        response.writeHead(200, {'content-type': 'application/json'}).end('{"symbol":"ETHUSDT","price":"2345.67"}');
+    } else if (request.url === '/redirect') {
         response.writeHead(302, {location: `http://127.0.0.1:${plain.address().port}/price`});
         response.end();
     } else if (request.url === '/trickle') {

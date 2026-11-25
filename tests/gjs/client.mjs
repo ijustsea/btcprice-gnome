@@ -45,19 +45,20 @@ server.add_handler(null, (_server, message, path) => {
 server.listen_local(0, Soup.ServerListenOptions.IPV4_ONLY);
 const base = server.get_uris()[0].to_string().replace(/\/$/, '');
 const client = new PriceClient();
-const fails = async (path, cancellable = caller()) => {
-    try { await client.fetchPrice(base + path, cancellable); } catch (error) { return error; }
+const source = (path, id = 'coinbase') => ({id, url: base + path});
+const fails = async (path, cancellable = caller(), id = 'coinbase') => {
+    try { await client.fetchPrice(source(path, id), cancellable); } catch (error) { return error; }
     return null;
 };
 
 const run = async () => {
-    assert(await client.fetchPrice(base + '/coinbase', caller()) === 61763.77, 'Coinbase body parsed');
-    assert(await client.fetchPrice(base + '/binance', caller()) === 61725.04, 'Binance body parsed');
+    assert((await client.fetchPrice(source('/coinbase'), caller())).price === 61763.77, 'Coinbase body parsed');
+    assert((await client.fetchPrice(source('/binance', 'binance'), caller())).price === 61725.04, 'Binance body parsed');
     assert(ports.length === 2 && ports[0] === ports[1], 'consecutive healthy reads reuse one connection: ' + ports.join());
     assert((await fails('/error'))?.message.includes('HTTP 503'), 'HTTP errors reject with the status');
     assert(await fails('/html'), 'a non-JSON body rejects');
     assert((await fails('/big'))?.message.includes('exceeds'), 'an oversized body is rejected, not buffered');
-    assert(await client.fetchPrice(base + '/limit', caller()) === 61763.77, 'a body just under the bound is accepted');
+    assert((await client.fetchPrice(source('/limit'), caller())).price === 61763.77, 'a body just under the bound is accepted');
     const cancellable = caller();
     const pending = fails('/hang', cancellable);
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => { cancellable.cancel(); return GLib.SOURCE_REMOVE; });

@@ -20,11 +20,13 @@ BtcPriceExtension.prototype.enable = function () {
     const reportPath = ProbeGLib.getenv('BTCPRICE_UI_REPORT');
     if (!reportPath) return;
     if (extension.probed) {
-        // A later enable is the runner's lock/unlock: record the panel at once and after the first read.
+        // Record the visible state immediately and after the startup poll on each re-enable.
+        const restoreNumber = (extension.restoreNumber ?? 0) + 1;
+        extension.restoreNumber = restoreNumber;
         const panel = () => ({text: extension.indicator.label.get_text(), source: extension.indicator.source.get_text(),
             status: extension.indicator.status.get_text()});
         const atEnable = panel();
-        void extension.controller.pending.then(() => probeWrite(reportPath + '.reenable', {atEnable, afterRead: panel()}));
+        void extension.controller.pending.then(() => probeWrite(reportPath + '.reenable-' + restoreNumber, {atEnable, afterRead: panel()}));
         return;
     }
     extension.probed = true;

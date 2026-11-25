@@ -1,7 +1,18 @@
 export type SourceId = 'coinbase' | 'binance';
 export interface Source { id: SourceId; url: string; }
-export interface Quote { source: SourceId; price: number; receivedAt: number; }
+export interface MarketPrice {
+    price: number;
+    tradedAt: number | null;
+    tradeAgeMs: number | null;
+}
+export interface Quote extends MarketPrice { source: SourceId; receivedAt: number; }
 export interface PriceView { quote: Quote | null; failing: boolean; }
+
+export class PriceHttpError extends Error {
+    constructor(readonly status: number, readonly retryAfterMs: number | null, url: string) {
+        super(`HTTP ${status} from ${url}`);
+    }
+}
 
 /** Priority order: Coinbase answers every poll; Binance is asked only when Coinbase fails.
  * Plain objects so the isolated Shell smoke test can point them at a local server. */
@@ -14,26 +25,55 @@ export const SOURCES: Source[] = [
  * the whole-dollar price differed between reads 5 s apart 84% of the time. 0.2 requests/s is far below
  * Coinbase's public limit of 10 per second per IP. */
 export const POLL_SECONDS = 5;
-/** Longest wait after failures. A network notification retries at once; without one the price is live again
- * within about a minute. Without a link requests fail locally; on a network that drops packets each source
- * waits out the request deadline, still only one or two requests a minute. */
+/** Maximum local backoff. A longer Retry-After sent by a source takes precedence. */
 export const MAX_RETRY_SECONDS = 60;
 /** Also not live: a price older than a minute, e.g. the last price shown again after an unlock. */
 export const STALE_MS = 60_000;
+const TRADE_CLOCK_SKEW_MS = 3_000;
 
-/** Both endpoints answer {"price": "61763.77", ...}; anything else is rejected, never shown.
- * A price below 1 would display as $0, so it is treated as a bad answer, not a price. */
-export function parsePrice(body: string): number {
+function priceObject(body: string): Record<string, unknown> {
     const value: unknown = JSON.parse(body);
     if (!value || typeof value !== 'object' || Array.isArray(value))
         throw new Error('Price response is not a JSON object');
-    const price = (value as Record<string, unknown>).price;
+    return value as Record<string, unknown>;
+}
+
+/** A price below 1 would display as $0, so it is treated as a bad answer. */
+function decimalPrice(price: unknown): number {
     if (typeof price !== 'string' || !/^\d{1,9}(?:\.\d{1,12})?$/.test(price))
         // Quoted, so server text cannot start a new log line.
         throw new Error(`Unexpected price field: ${JSON.stringify(String(price).slice(0, 40))}`);
     const number = Number(price);
     if (!(number >= 1)) throw new Error(`Price is below 1: ${price}`);
     return number;
+}
+
+function tradeTime(value: unknown): number | null {
+    // Coinbase uses UTC ISO timestamps with up to nanosecond precision.
+    if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(value)) return null;
+    const ms = Date.parse(value);
+    // Date.parse can normalize invalid calendar dates; keep those unknown.
+    return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 19) === value.slice(0, 19) ? ms : null;
+}
+
+export function secondsHeader(value: string | null): number | null {
+    if (value === null || !/^\d+$/.test(value.trim())) return null;
+    return Math.min(Number(value), Math.floor(Number.MAX_SAFE_INTEGER / 1000));
+}
+
+export function parseMarketPrice(body: string, source: SourceId, responseDate: number | null, ageHeader: string | null): MarketPrice {
+    const data = priceObject(body);
+    if (source === 'binance' && data.symbol !== 'BTCUSDT') throw new Error('Unexpected Binance symbol');
+    const price = decimalPrice(data.price);
+    const tradedAt = source === 'coinbase' ? tradeTime(data.time) : null;
+    let tradeAgeMs: number | null = null;
+    if (tradedAt !== null && responseDate !== null) {
+        const atOrigin = responseDate - tradedAt;
+        // Response and trade clocks can differ slightly. Clock skew cannot erase time spent in a cache.
+        if (Number.isFinite(atOrigin) && atOrigin >= -TRADE_CLOCK_SKEW_MS)
+            tradeAgeMs = Math.max(0, atOrigin) + (secondsHeader(ageHeader) ?? 0) * 1000;
+    }
+    return {price, tradedAt, tradeAgeMs};
 }
 
 export function formatPrice(price: number, decimals = 0): string {
@@ -47,7 +87,11 @@ function withUnit(quote: Quote, value: string): string {
 
 /** Not live: the latest poll failed everywhere, or the price is old (e.g. shown again after an unlock). */
 export function isLive(view: PriceView, now: number): boolean {
-    return view.quote !== null && !view.failing && now - view.quote.receivedAt <= STALE_MS;
+    const {quote} = view;
+    if (!quote || view.failing) return false;
+    const elapsed = now - quote.receivedAt;
+    if (elapsed < 0 || elapsed > STALE_MS) return false;
+    return quote.source === 'binance' || (quote.tradeAgeMs !== null && quote.tradeAgeMs + elapsed <= STALE_MS);
 }
 
 export function panelText(view: PriceView, now: number): string {
@@ -71,11 +115,18 @@ function clock(ms: number): string {
 }
 
 /** The source itself is shown beside the title, so this says only when the price was received and why it may differ. */
-export function statusText(view: PriceView): string {
+export function statusText(view: PriceView, now: number): string {
     const quote = view.quote;
     if (!quote) return view.failing ? '가격을 받지 못했습니다 · 재시도 중' : '가격 확인 중…';
-    const parts = [`${clock(quote.receivedAt)} 기준`];
-    if (quote.source !== 'coinbase') parts.unshift('Coinbase 응답 없음');
+    const parts: string[] = [];
+    if (quote.source === 'binance') {
+        parts.push('대체 시세', `${clock(quote.receivedAt)} 수신`);
+    } else if (quote.tradedAt === null || quote.tradeAgeMs === null) {
+        parts.push(`${clock(quote.receivedAt)} 수신`, '신선도 미확인');
+    } else {
+        parts.push(`${clock(quote.tradedAt)} 체결`);
+        if (quote.tradeAgeMs + Math.max(0, now - quote.receivedAt) > STALE_MS) parts.push('오래된 체결');
+    }
     if (view.failing) parts.push('재시도 중');
     return parts.join(' · ');
 }

@@ -4,11 +4,12 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {PriceClient} from './client.js';
 import {PriceController} from './controller.js';
 import {PriceIndicator} from './indicator.js';
-import type {Quote} from './price.js';
+import type {PriceView, SourceId} from './price.js';
 
 // Survives the disable/enable that GNOME performs around the lock screen, so unlocking shows the
 // last price at once (marked not live when older than a minute) and keeps it if the first read fails.
-let lastQuote: Quote | null = null;
+let lastView: PriceView | undefined;
+const serverCooldowns = new Map<SourceId, number>();
 const CHART_URL = 'https://www.tradingview.com/chart/?symbol=COINBASE%3ABTCUSD';
 
 /** No input-idle pause: lack of input is no reason to freeze a price that is still on screen. Polling stops
@@ -33,9 +34,10 @@ export default class BtcPriceExtension extends Extension {
         this.indicator = indicator;
         Main.panel.addToStatusArea(this.uuid, indicator.button);
         this.controller = new PriceController({
-            initialQuote: lastQuote,
-            fetchPrice: (url, cancellable) => client.fetchPrice(url, cancellable),
-            publish: view => { lastQuote = view.quote; this.indicator?.update(view, Date.now()); },
+            initialView: lastView,
+            serverCooldowns,
+            fetchPrice: (source, cancellable) => client.fetchPrice(source, cancellable),
+            publish: view => { lastView = view; this.indicator?.update(view, Date.now()); },
         });
         this.controller.start();
         // Event-driven: when the internet is reachable again, a failing price is read at once instead of

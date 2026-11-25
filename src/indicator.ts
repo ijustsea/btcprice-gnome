@@ -64,7 +64,7 @@ export class PriceIndicator {
         if (view.quote) setText(this.source, sourceName(view.quote.source));
         setText(this.price, menuPrice(view));
         this.price.opacity = isLive(view, now) ? 255 : 150;
-        setText(this.status, statusText(view));
+        setText(this.status, statusText(view, now));
     }
 
     destroy(): void {

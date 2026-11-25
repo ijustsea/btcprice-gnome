@@ -32,9 +32,10 @@ const server = createServer((request, response) => {
     const source = url.pathname.slice(1);
     if (!(source in counts)) { response.writeHead(404).end(); return; }
     counts[source]++;
+    if (modes[source] === 'rate-limited') { response.writeHead(429, {'Retry-After': '120'}).end(); return; }
     if (modes[source] !== 'ok') { response.writeHead(503).end('{"message":"unavailable"}'); return; }
     response.writeHead(200, {'content-type': 'application/json'});
-    response.end(source === 'coinbase' ? '{"ask":"61764.10","bid":"61763.76","price":"61763.77","time":"2026-11-23T17:27:15Z"}'
+    response.end(source === 'coinbase' ? JSON.stringify({price: '61763.77', time: new Date().toISOString()})
         : '{"symbol":"BTCUSDT","price":"61770.30000000"}');
 });
 await new Promise(ok => server.listen(0, '127.0.0.1', ok));
@@ -86,7 +87,7 @@ try {
     if (Math.max(...report.widths) - Math.min(...report.widths) > 0.5) fail('Digits are not tabular; the panel would shift', report.widths);
     if (report.steady.length !== 1 || report.steady[0] !== 'BTC $61,764') fail('Panel text changed during a refresh', report.steady);
     if (report.fallback.text !== 'BTC 61,770 USDT' || report.fallback.source !== 'Binance' || report.fallback.price !== '61,770.30 USDT'
-        || !report.fallback.status.startsWith('Coinbase 응답 없음') || !near(report.fallback.delay, healthy))
+        || !report.fallback.status.startsWith('대체 시세') || !near(report.fallback.delay, healthy))
         fail('Binance fallback not shown', report.fallback);
     if (report.allFail.text !== 'BTC ~61,770 USDT' || !report.allFail.status.includes('재시도') || !near(report.allFail.delay, backoff))
         fail(`Total failure must keep the last price marked not live and back off to ${backoff} s`, report.allFail);
@@ -104,22 +105,52 @@ try {
     if (!/\(\[\]|@as \[\]/.test(errors)) fail('Extension errors', errors);
     call('org.gnome.Shell.Extensions.DisableExtension', meta.uuid);
     const afterDisable = {...counts};
-    await sleep(1500);
+    await sleep(6250);
     if (counts.coinbase !== afterDisable.coinbase || counts.binance !== afterDisable.binance) fail('Requests continued after disable', counts);
     // Unlock while the network is still down: the last price must stay, marked not live.
     await fetch(`${base}/mode?coinbase=fail&binance=fail`);
     call('org.gnome.Shell.Extensions.EnableExtension', meta.uuid);
-    let unlock = null;
-    for (let i = 0; i < 50 && !unlock; i++) { try { unlock = JSON.parse(await readFile(env.BTCPRICE_UI_REPORT + '.reenable', 'utf8')); } catch { await sleep(100); } }
+    const readRestore = async number => {
+        for (let i = 0; i < 50; i++) {
+            try { return JSON.parse(await readFile(env.BTCPRICE_UI_REPORT + '.reenable-' + number, 'utf8')); }
+            catch { await sleep(100); }
+        }
+        return null;
+    };
+    const unlock = await readRestore(1);
     if (unlock?.atEnable.text !== 'BTC $61,764' || unlock.afterRead.text !== 'BTC ~$61,764'
         || unlock.afterRead.source !== 'Coinbase' || !unlock.afterRead.status.includes('재시도'))
         fail('After an offline unlock the last price must stay, marked not live', unlock);
+    call('org.gnome.Shell.Extensions.DisableExtension', meta.uuid);
+    call('org.gnome.Shell.Extensions.EnableExtension', meta.uuid);
+    const failingRestore = await readRestore(2);
+    if (failingRestore?.atEnable.text !== 'BTC ~$61,764' || failingRestore.afterRead.text !== 'BTC ~$61,764')
+        fail('A previously failing price must keep its marker before and after the first read', failingRestore);
+    if (counts.coinbase !== afterDisable.coinbase + 2 || counts.binance !== afterDisable.binance + 2)
+        fail('Each re-enable should read Coinbase once, then Binance once', counts);
+
+    // Let the real extension receive Retry-After, then recreate its controller through GNOME.
+    call('org.gnome.Shell.Extensions.DisableExtension', meta.uuid);
+    await fetch(`${base}/mode?coinbase=rate-limited&binance=ok`);
+    const beforeLimit = {...counts};
+    call('org.gnome.Shell.Extensions.EnableExtension', meta.uuid);
+    const limited = await readRestore(3);
+    if (limited?.afterRead.source !== 'Binance' || counts.coinbase !== beforeLimit.coinbase + 1 || counts.binance !== beforeLimit.binance + 1)
+        fail('Coinbase should send a real 429 and fall back to Binance before re-enable', {limited, counts});
+
+    call('org.gnome.Shell.Extensions.DisableExtension', meta.uuid);
+    await fetch(`${base}/mode?coinbase=ok&binance=ok`);
+    const beforeLimitedRestore = {...counts};
+    call('org.gnome.Shell.Extensions.EnableExtension', meta.uuid);
+    const limitedRestore = await readRestore(4);
+    if (limitedRestore?.afterRead.source !== 'Binance' || counts.coinbase !== beforeLimitedRestore.coinbase
+        || counts.binance !== beforeLimitedRestore.binance + 1)
+        fail('The actual extension must keep Coinbase in server cooldown after re-enable', {limitedRestore, counts});
     const after = call('org.gnome.Shell.Extensions.GetExtensionErrors', meta.uuid);
     if (!/\(\[\]|@as \[\]/.test(after)) fail('Re-enable errors', after);
-    if (counts.coinbase !== afterDisable.coinbase + 1 || counts.binance !== afterDisable.binance + 1)
-        fail('Re-enable should read Coinbase once, then Binance once', counts);
     console.log(`Panel ${report.first} (tabular widths ${report.widths.map(Math.round).join('/')}px), steady during refresh, fallback "${report.fallback.text}", all-fail backoff ${Math.round(report.allFail.delay)}s, recovery ${healthy}s, menu price "${report.recovered.price}", Refresh kept the menu open, menu ${Math.round(report.menu.width)}x${Math.round(report.menu.height)}`);
-    console.log(`Offline unlock keeps "${unlock.afterRead.text}" (${unlock.afterRead.status})`);
+    console.log(`Restore preserves a healthy price before failure and "${failingRestore.atEnable.text}" after a previous failure`);
+    console.log('Coinbase Retry-After survives an actual Shell disable/re-enable cycle while Binance remains available');
     console.log('Isolated GNOME Shell smoke passed: Coinbase first, Binance fallback, backoff, steady tabular panel, no requests after disable, offline unlock keeps the last price.');
 } catch (error) {
     console.error(log);

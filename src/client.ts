@@ -1,13 +1,31 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Soup from 'gi://Soup?version=3.0';
-import {parsePrice} from './price.js';
+import {parseMarketPrice, PriceHttpError, secondsHeader, type MarketPrice, type Source} from './price.js';
 
 const MAX_BODY = 16 * 1024;
 /** The whole request (DNS, connect, TLS, headers, body) must finish within this. Soup's own timeout
  * (60 s by default) only bounds each socket wait, so a trickling body or a slow DNS answer could
  * otherwise hold every later poll. */
 const DEADLINE_SECONDS = 10;
+// An unanchored HTTP date can look expired when this PC's clock is ahead.
+const UNANCHORED_RETRY_MIN_MS = 120_000;
+
+function httpDate(value: string | null): number | null {
+    if (!value || value.length > 80) return null;
+    const date = Soup.date_time_new_from_http_string(value);
+    return date === null ? null : date.to_unix() * 1000;
+}
+
+function retryAfter(value: string | null, date: number | null): number | null {
+    const seconds = secondsHeader(value);
+    if (seconds !== null) return seconds * 1000;
+    const retryAt = httpDate(value);
+    if (retryAt === null) return null;
+    return date === null
+        ? Math.max(UNANCHORED_RETRY_MIN_MS, retryAt - Date.now())
+        : Math.max(0, retryAt - date);
+}
 
 /** One session for the extension's lifetime, so polls reuse one HTTPS connection
  * (measured process CPU per Coinbase poll: 11-12.5 ms when each poll opened a new TLS connection,
@@ -18,7 +36,7 @@ const DEADLINE_SECONDS = 10;
 export class PriceClient {
     private session = new Soup.Session({user_agent: 'btcprice-gnome'});
 
-    async fetchPrice(url: string, cancellable: Gio.Cancellable): Promise<number> {
+    async fetchPrice(source: Source, cancellable: Gio.Cancellable): Promise<MarketPrice> {
         // Cancelled by the caller (stop/disable) or by the deadline, whichever comes first.
         const request = new Gio.Cancellable();
         const link = cancellable.connect(() => request.cancel());
@@ -31,9 +49,9 @@ export class PriceClient {
             return GLib.SOURCE_REMOVE;
         });
         try {
-            return await this.read(url, request);
+            return await this.read(source, request);
         } catch (error) {
-            if (expired) throw new Error(`No complete answer from ${url} within ${DEADLINE_SECONDS} s`, {cause: error});
+            if (expired) throw new Error(`No complete answer from ${source.url} within ${DEADLINE_SECONDS} s`, {cause: error});
             throw error;
         } finally {
             if (deadline) GLib.Source.remove(deadline);
@@ -41,7 +59,7 @@ export class PriceClient {
         }
     }
 
-    private async read(url: string, cancellable: Gio.Cancellable): Promise<number> {
+    private async read({id, url}: Source, cancellable: Gio.Cancellable): Promise<MarketPrice> {
         const message = Soup.Message.new('GET', url);
         message.set_force_http1(true);
         // Both APIs answer directly; a redirect could leave HTTPS or the expected host, so it is a failure.
@@ -51,8 +69,13 @@ export class PriceClient {
                 try { resolve(session!.send_finish(result)); } catch (error) { reject(error); }
             }));
         try {
-            const status = message.get_status();
-            if (status !== Soup.Status.OK) throw new Error(`HTTP ${status} from ${url}`);
+            // The numeric property also represents codes absent from the GI enum, such as 429 and 418.
+            const status = message.status_code;
+            const headers = message.get_response_headers();
+            const date = httpDate(headers.get_one('Date'));
+            if (status !== Soup.Status.OK) throw new PriceHttpError(status,
+                [418, 429, 503].includes(status) ? retryAfter(headers.get_one('Retry-After'), date) : null, url);
+            const headersAt = GLib.get_monotonic_time();
             // Bounded read: an unexpectedly large body is rejected instead of buffered.
             const chunks: Uint8Array[] = [];
             let size = 0;
@@ -69,7 +92,9 @@ export class PriceClient {
             const body = new Uint8Array(size);
             let offset = 0;
             for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.length; }
-            return parsePrice(new TextDecoder('utf-8', {fatal: true}).decode(body));
+            const reading = parseMarketPrice(new TextDecoder('utf-8', {fatal: true}).decode(body), id, date, headers.get_one('Age'));
+            if (reading.tradeAgeMs !== null) reading.tradeAgeMs += (GLib.get_monotonic_time() - headersAt) / 1000;
+            return reading;
         } finally {
             stream.close(null);
         }

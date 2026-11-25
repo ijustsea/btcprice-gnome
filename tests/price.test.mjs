@@ -1,9 +1,10 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {parsePrice, formatPrice, isLive, panelText, menuPrice, sourceName, statusText, nextDelaySeconds, SOURCES, STALE_MS} from '../build/price.js';
+import {parseMarketPrice, formatPrice, isLive, panelText, menuPrice, sourceName, statusText, nextDelaySeconds, SOURCES, STALE_MS} from '../build/price.js';
 
 const now = 1_800_000_000_000;
-const view = (source, changes = {}) => ({quote: {source, price: 61763.77, receivedAt: now}, failing: false, ...changes});
+const view = (source, changes = {}) => ({quote: {source, price: 61763.77, receivedAt: now, tradedAt: now, tradeAgeMs: 0}, failing: false, ...changes});
+const parsePrice = (body, source = 'coinbase') => parseMarketPrice(body, source, null, null).price;
 
 test('Coinbase is asked first and Binance only as the fallback', () => {
     assert.deepEqual(SOURCES.map(source => source.id), ['coinbase', 'binance']);
@@ -13,7 +14,53 @@ test('Coinbase is asked first and Binance only as the fallback', () => {
 
 test('both real response shapes parse to the price', () => {
     assert.equal(parsePrice('{"ask":"61764.10","bid":"61763.76","volume":"8231.2","trade_id":1,"price":"61763.77","size":"0.01","time":"2026-11-23T17:27:15.491339698Z"}'), 61763.77);
-    assert.equal(parsePrice('{"symbol":"BTCUSDT","price":"61725.04000000"}'), 61725.04);
+    assert.equal(parsePrice('{"symbol":"BTCUSDT","price":"61725.04000000"}', 'binance'), 61725.04);
+});
+
+test('Coinbase freshness uses server Date and cache Age, independent of the PC clock at receipt', () => {
+    const trade = '2026-11-23T17:27:15.491339698Z';
+    const parsed = parseMarketPrice(JSON.stringify({price: '61763.77', time: trade}), 'coinbase',
+        Date.parse('2026-11-23T17:27:16Z'), '60');
+    assert.equal(parsed.tradedAt, Date.parse(trade));
+    assert.equal(parsed.tradeAgeMs, 60509);
+    const stale = {quote: {...parsed, source: 'coinbase', receivedAt: now}, failing: false};
+    assert.equal(panelText(stale, now), 'BTC ~$61,764');
+    assert.match(statusText(stale, now), /오래된 체결/);
+    const unknown = {...stale, quote: {...stale.quote, tradeAgeMs: null}};
+    assert.match(statusText(unknown, now), /신선도 미확인/);
+    assert.equal(isLive(unknown, now), false);
+});
+
+test('Coinbase tolerates HTTP Date precision, leaves invalid dates unknown, and ages a known trade after receipt', () => {
+    const parse = (time, date) => parseMarketPrice(JSON.stringify({price: '61763.77', time}), 'coinbase', date, null);
+    const trade = '2026-11-23T17:27:15.491339698Z';
+    const date = Date.parse('2026-11-23T17:27:15Z');
+    assert.equal(parse(trade, date).tradeAgeMs, 0);
+    assert.equal(parse(trade, date - 10000).tradeAgeMs, null);
+    assert.equal(parse(trade, null).tradeAgeMs, null);
+    assert.equal(parse('2026-02-30T17:27:15Z', date).tradedAt, null);
+    const nearlyOld = {quote: {...parse(trade, date + 59000), source: 'coinbase', receivedAt: now}, failing: false};
+    assert.equal(isLive(nearlyOld, now), true);
+    assert.equal(isLive(nearlyOld, now + 2000), false);
+});
+
+test('Binance accepts only BTCUSDT and displays receive time', () => {
+    for (const body of ['{"symbol":"ETHUSDT","price":"2345.67"}', '{"price":"2345.67"}'])
+        assert.throws(() => parseMarketPrice(body, 'binance', null, null), /symbol/i);
+    const parsed = parseMarketPrice('{"symbol":"BTCUSDT","price":"61725.04"}', 'binance', null, null);
+    assert.equal(parsed.price, 61725.04);
+    assert.match(statusText({quote: {...parsed, source: 'binance', receivedAt: now}, failing: false}, now), /수신/);
+});
+
+test('Coinbase accepts up to three seconds of clock skew without subtracting cache age', () => {
+    const trade = '2026-11-23T17:27:15Z';
+    const date = Date.parse(trade) - 3000;
+    const body = JSON.stringify({price: '61763.77', time: trade});
+    const price = parseMarketPrice(body, 'coinbase', date, '61');
+    assert.equal(price.tradeAgeMs, 61_000);
+    assert.equal(isLive({quote: {...price, source: 'coinbase', receivedAt: now}, failing: false}, now), false);
+    assert.equal(parseMarketPrice(body, 'coinbase', date, null).tradeAgeMs, 0);
+    assert.equal(parseMarketPrice(body, 'coinbase', date - 1, '61').tradeAgeMs, null);
 });
 
 test('anything but a decimal price string of at least 1 is rejected rather than shown', () => {
@@ -65,14 +112,14 @@ test('a price is marked not live only after a failed poll or when over a minute 
 });
 
 test('menu status gives the time of the price, why Binance is shown and any retry', () => {
-    assert.equal(statusText({quote: null, failing: false}), '가격 확인 중…');
-    assert.equal(statusText({quote: null, failing: true}), '가격을 받지 못했습니다 · 재시도 중');
-    assert.match(statusText(view('coinbase')), /^\d{2}:\d{2}:\d{2} 기준$/);
-    assert.match(statusText(view('coinbase', {failing: true})), /^\d{2}:\d{2}:\d{2} 기준 · 재시도 중$/);
-    assert.match(statusText(view('binance')), /^Coinbase 응답 없음 · \d{2}:\d{2}:\d{2} 기준$/);
-    assert.match(statusText(view('binance', {failing: true})), /^Coinbase 응답 없음 · .* 기준 · 재시도 중$/);
+    assert.equal(statusText({quote: null, failing: false}, now), '가격 확인 중…');
+    assert.equal(statusText({quote: null, failing: true}, now), '가격을 받지 못했습니다 · 재시도 중');
+    assert.match(statusText(view('coinbase'), now), /^\d{2}:\d{2}:\d{2} 체결$/);
+    assert.match(statusText(view('coinbase', {failing: true}), now), /^\d{2}:\d{2}:\d{2} 체결 · 재시도 중$/);
+    assert.match(statusText(view('binance'), now), /^대체 시세 · \d{2}:\d{2}:\d{2} 수신$/);
+    assert.match(statusText(view('binance', {failing: true}), now), /^대체 시세 · .* 수신 · 재시도 중$/);
 });
 
-test('polling is every 5 s and backs off to at most a minute only after every source failed', () => {
+test('local polling and failure delays range from 5 seconds to one minute', () => {
     assert.deepEqual([0, 1, 2, 3, 4, 50, 5000].map(nextDelaySeconds), [5, 10, 20, 40, 60, 60, 60]);
 });

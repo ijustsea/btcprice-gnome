@@ -103,11 +103,31 @@ test('disable stops polling, closes the connection and removes the UI and the ne
 
 test('after a lock-screen disable/enable the new controller starts from the last price', () => {
     const h = harness();
-    assert.equal(h.controller.options.initialQuote, null, 'nothing to show on the first enable');
+    assert.equal(h.controller.options.initialView, undefined, 'nothing to show on the first enable');
     const quote = {source: 'coinbase', price: 61763.77, receivedAt: 1};
     h.controller.options.publish({quote, failing: false});
     h.extension.disable();
     h.extension.enable();
-    assert.deepEqual(h.controller.options.initialQuote, quote);
+    assert.deepEqual(h.controller.options.initialView, {quote, failing: false});
+    h.extension.disable();
+});
+
+test('reenabling preserves the failure marker as well as the price from the previous view', () => {
+    const h = harness();
+    const view = {quote: {source: 'coinbase', price: 61763.77, receivedAt: 1}, failing: true};
+    h.controller.options.publish(view);
+    h.extension.disable();
+    h.extension.enable();
+    assert.deepEqual(h.controller.options.initialView, view);
+    h.extension.disable();
+});
+
+test('reenabling passes forward a failed view even when no price was received', () => {
+    const h = harness();
+    const view = {quote: null, failing: true};
+    h.controller.options.publish(view);
+    h.extension.disable();
+    h.extension.enable();
+    assert.deepEqual(h.controller.options.initialView, view);
     h.extension.disable();
 });
