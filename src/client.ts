@@ -9,7 +9,7 @@ const MAX_BODY = 16 * 1024;
  * otherwise hold every later poll. */
 const DEADLINE_SECONDS = 10;
 
-/** One session for the extension's lifetime, so 15-second polls reuse one HTTPS connection
+/** One session for the extension's lifetime, so polls reuse one HTTPS connection
  * (measured process CPU per Coinbase poll: 11-12.5 ms when each poll opened a new TLS connection,
  * 4.6-4.8 ms reusing one). Requests stay on HTTP/1.1 because the deadline below must be able to end
  * them: in libsoup 3.8, cancelling an HTTP/2 request that awaits headers did not end it (still

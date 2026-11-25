@@ -1,9 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {parsePrice, formatPrice, panelText, statusText, nextDelaySeconds, SOURCES, STALE_MS} from '../build/price.js';
+import {parsePrice, formatPrice, isLive, panelText, menuPrice, sourceName, statusText, nextDelaySeconds, SOURCES, STALE_MS} from '../build/price.js';
 
 const now = 1_800_000_000_000;
-const view = (source, changes = {}) => ({quote: {source, price: 61763.77, receivedAt: now}, failing: false, paused: false, ...changes});
+const view = (source, changes = {}) => ({quote: {source, price: 61763.77, receivedAt: now}, failing: false, ...changes});
 
 test('Coinbase is asked first and Binance only as the fallback', () => {
     assert.deepEqual(SOURCES.map(source => source.id), ['coinbase', 'binance']);
@@ -37,28 +37,42 @@ test('prices round to whole dollars with thousands separators', () => {
     assert.equal(formatPrice(42), '42');
 });
 
+test('the menu shows the exact price to the cent', () => {
+    assert.equal(formatPrice(61763.77, 2), '61,763.77');
+    assert.equal(formatPrice(61770.3, 2), '61,770.30');
+    assert.equal(formatPrice(1, 2), '1.00');
+    assert.equal(formatPrice(61763.776, 2), '61,763.78');
+    assert.equal(formatPrice(999999999.99, 2), '999,999,999.99', 'nine integer digits, the most parsePrice accepts');
+    assert.equal(menuPrice({quote: null, failing: false}), '—');
+    assert.equal(menuPrice(view('coinbase')), '$61,763.77');
+    assert.equal(menuPrice(view('binance')), '61,763.77 USDT');
+    assert.deepEqual(['coinbase', 'binance'].map(sourceName), ['Coinbase', 'Binance']);
+});
+
 test('panel shows Coinbase in dollars and a Binance fallback in USDT', () => {
-    assert.equal(panelText({quote: null, failing: false, paused: false}, now), 'BTC —');
+    assert.equal(panelText({quote: null, failing: false}, now), 'BTC —');
     assert.equal(panelText(view('coinbase'), now), 'BTC $61,764');
     assert.equal(panelText(view('binance'), now), 'BTC 61,764 USDT');
 });
 
-test('a price is marked not live only after a failed poll, while paused or when over a minute old', () => {
+test('a price is marked not live only after a failed poll or when over a minute old', () => {
     assert.equal(panelText(view('coinbase'), now + STALE_MS), 'BTC $61,764');
     assert.equal(panelText(view('coinbase'), now + STALE_MS + 1), 'BTC ~$61,764');
     assert.equal(panelText(view('coinbase', {failing: true}), now), 'BTC ~$61,764', 'shown from the first failed poll');
     assert.equal(panelText(view('binance', {failing: true}), now), 'BTC ~61,764 USDT');
-    assert.equal(panelText(view('coinbase', {paused: true}), now), 'BTC ~$61,764');
+    assert.deepEqual([isLive(view('coinbase'), now + STALE_MS), isLive(view('coinbase'), now + STALE_MS + 1),
+        isLive(view('coinbase', {failing: true}), now), isLive({quote: null, failing: false}, now)], [true, false, false, false]);
 });
 
-test('menu status names the source, the time of the price and any retry or pause', () => {
-    assert.equal(statusText({quote: null, failing: false, paused: false}), '가격 확인 중…');
-    assert.equal(statusText({quote: null, failing: true, paused: false}), '가격을 받지 못했습니다 · 재시도 중');
-    assert.match(statusText(view('coinbase')), /^Coinbase · \d{2}:\d{2}:\d{2} 기준$/);
-    assert.match(statusText(view('binance', {failing: true})), /^Binance \(Coinbase 응답 없음\) · .* · 재시도 중$/);
-    assert.match(statusText(view('coinbase', {paused: true, failing: true})), / · 자리 비움으로 일시정지$/);
+test('menu status gives the time of the price, why Binance is shown and any retry', () => {
+    assert.equal(statusText({quote: null, failing: false}), '가격 확인 중…');
+    assert.equal(statusText({quote: null, failing: true}), '가격을 받지 못했습니다 · 재시도 중');
+    assert.match(statusText(view('coinbase')), /^\d{2}:\d{2}:\d{2} 기준$/);
+    assert.match(statusText(view('coinbase', {failing: true})), /^\d{2}:\d{2}:\d{2} 기준 · 재시도 중$/);
+    assert.match(statusText(view('binance')), /^Coinbase 응답 없음 · \d{2}:\d{2}:\d{2} 기준$/);
+    assert.match(statusText(view('binance', {failing: true})), /^Coinbase 응답 없음 · .* 기준 · 재시도 중$/);
 });
 
-test('polling is every 15 s and backs off to at most a minute only after every source failed', () => {
-    assert.deepEqual([0, 1, 2, 3, 4, 50, 5000].map(nextDelaySeconds), [15, 30, 60, 60, 60, 60, 60]);
+test('polling is every 5 s and backs off to at most a minute only after every source failed', () => {
+    assert.deepEqual([0, 1, 2, 3, 4, 50, 5000].map(nextDelaySeconds), [5, 10, 20, 40, 60, 60, 60]);
 });

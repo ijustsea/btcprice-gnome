@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib';
 import {PriceController} from '../../build/controller.js';
+import {nextDelaySeconds} from '../../build/price.js';
 
 const assert = (value, message) => { if (!value) throw new Error(message); };
 const tick = () => new Promise(resolve => GLib.idle_add(GLib.PRIORITY_DEFAULT, () => { resolve(); return GLib.SOURCE_REMOVE; }));
@@ -40,45 +41,38 @@ const run = async () => {
     h.controller.start(); await h.controller.pending;
     assert(h.calls.join() === 'cb', 'Coinbase alone answers a healthy poll');
     assert(h.views.at(-1).quote.source === 'coinbase' && h.views.at(-1).quote.price === 61763.77 && !h.views.at(-1).failing, 'Coinbase quote published');
-    near(delay(h.controller), 15, 'healthy interval');
+    const [healthy, firstBackoff, secondBackoff] = [0, 1, 2].map(nextDelaySeconds);
+    near(delay(h.controller), healthy, 'healthy interval');
 
     h.answers.cb = new Error('HTTP 503'); h.calls.length = 0;
     await h.controller.refresh();
     assert(h.calls.join() === 'cb,bn' && h.views.at(-1).quote.source === 'binance' && !h.views.at(-1).failing, 'Binance answers only after Coinbase fails');
-    near(delay(h.controller), 15, 'a successful fallback keeps 15 s');
+    near(delay(h.controller), healthy, 'a successful fallback keeps the healthy interval');
 
     h.answers.bn = new Error('offline'); h.calls.length = 0;
     await h.controller.refresh();
     assert(h.views.at(-1).failing && h.views.at(-1).quote.price === 61725.04, 'all sources failing keeps the last price and reports it');
-    near(delay(h.controller), 30, 'first total failure backs off');
+    near(delay(h.controller), firstBackoff, 'first total failure backs off');
     await h.controller.refresh();
-    near(delay(h.controller), 60, 'second total failure backs off further');
+    near(delay(h.controller), secondBackoff, 'second total failure backs off further');
+    // The network returning (still failing here) retries at once instead of after the backoff.
+    h.calls.length = 0; h.controller.retryIfFailing();
+    assert(h.calls.join() === 'cb' && h.controller.pending !== null, 'a returning network retries at once while failing'); await h.controller.pending;
 
     h.answers.cb = 61800; h.calls.length = 0;
     await h.controller.refresh();
     assert(h.calls.join() === 'cb' && h.views.at(-1).quote.source === 'coinbase' && !h.views.at(-1).failing, 'Coinbase is retried first and recovery clears the failure');
-    near(delay(h.controller), 15, 'recovery returns to 15 s');
+    near(delay(h.controller), healthy, 'recovery returns to the healthy interval');
 
     const before = h.calls.length;
     const first = h.controller.refresh(), second = h.controller.refresh();
     assert(first === second, 'overlapping refreshes share one read'); await first;
     assert(h.calls.length === before + 1, 'only one request for overlapping refreshes');
 
-    h.controller.pause();
-    assert(h.controller.timer === 0 && h.views.at(-1).paused, 'pause stops polling and marks the price as not live');
-    await h.controller.refresh();
-    assert(h.controller.timer === 0, 'a manual read while paused schedules nothing');
-    const resumedAt = h.calls.length; h.controller.resume();
-    assert(h.controller.pending !== null && h.calls.length === resumedAt + 1, 'resume reads at once'); await h.controller.pending;
-    assert(!h.views.at(-1).paused, 'the fresh price is live again');
-    near(delay(h.controller), 15, 'resume restores the interval');
+    const healthyCalls = h.calls.length; h.controller.retryIfFailing();
+    assert(h.calls.length === healthyCalls && h.controller.pending === null, 'network notifications while healthy cause no request');
     h.controller.stop();
     assert(h.controller.timer === 0, 'stop removes the timer');
-
-    const idle = harness({cb: 1});
-    idle.controller.pause(); idle.controller.start();
-    assert(idle.calls.length === 0 && idle.controller.timer === 0, 'starting while paused does not read');
-    idle.controller.stop();
 
     const stopped = harness({cb: 'hang'});
     stopped.controller.start(); const views = stopped.views.length;
@@ -109,7 +103,7 @@ const run = async () => {
     const last = {source: 'coinbase', price: 61763.77, receivedAt: 1};
     const unlock = harness({cb: new Error('offline'), bn: new Error('offline')}, last);
     unlock.controller.start();
-    assert(unlock.views.length === 1 && unlock.views[0].quote === last && !unlock.views[0].failing && !unlock.views[0].paused,
+    assert(unlock.views.length === 1 && unlock.views[0].quote === last && !unlock.views[0].failing,
         'the last price is shown at once, before the first read');
     await unlock.controller.pending;
     assert(unlock.views.at(-1).quote === last && unlock.views.at(-1).failing, 'a failed first read keeps the last price, marked not live');
@@ -137,7 +131,7 @@ const run = async () => {
     await logs.controller.refresh();
     assert(warnings.length === 4 && /binance/.test(warnings[3]), 'a Binance failure after Coinbase recovered is a new streak: ' + warnings);
     logs.controller.stop();
-    print('Controller GJS checks passed: Coinbase first, Binance fallback, backoff, recovery, coalescing, pause/resume, stop, restart guard, UI errors, unlock keeps the last price, failure logs');
+    print('Controller GJS checks passed: Coinbase first, Binance fallback, backoff, recovery, coalescing, network retry, stop, restart guard, UI errors, unlock keeps the last price, failure logs');
 };
 const loop = new GLib.MainLoop(null, false);
 let failed = null;

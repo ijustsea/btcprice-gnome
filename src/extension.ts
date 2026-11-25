@@ -1,5 +1,4 @@
 import Gio from 'gi://Gio';
-import type Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {PriceClient} from './client.js';
@@ -7,23 +6,22 @@ import {PriceController} from './controller.js';
 import {PriceIndicator} from './indicator.js';
 import type {Quote} from './price.js';
 
-// No keyboard or pointer input for this long pauses polling; any input resumes it at once.
-// Idle inhibitors are respected, so the price stays live while a video plays.
-const IDLE_PAUSE_MS = 5 * 60 * 1000;
 // Survives the disable/enable that GNOME performs around the lock screen, so unlocking shows the
 // last price at once (marked not live when older than a minute) and keeps it if the first read fails.
 let lastQuote: Quote | null = null;
 const CHART_URL = 'https://www.tradingview.com/chart/?symbol=COINBASE%3ABTCUSD';
 
+/** No input-idle pause: lack of input is no reason to freeze a price that is still on screen. Polling stops
+ * when the screen blanks or locks, because GNOME's screen shield then enters the unlock-dialog session mode
+ * and disables the extension (GNOME Shell 51 with GDM and logind, as on Fedora), and timers do not run
+ * during suspend. It continues while the session is unlocked, e.g. under a fullscreen window. */
 export default class BtcPriceExtension extends Extension {
     private client: PriceClient | null = null;
     private controller: PriceController | null = null;
     private indicator: PriceIndicator | null = null;
-    private idleMonitor: Meta.IdleMonitor | null = null;
-    private idleWatch = 0;
-    private activeWatch = 0;
-    private idle = false;
     private launches = new Set<Gio.Cancellable>();
+    private networkMonitor: Gio.NetworkMonitor | null = null;
+    private networkChanged = 0;
 
     override enable(): void {
         const client = new PriceClient();
@@ -39,27 +37,22 @@ export default class BtcPriceExtension extends Extension {
             fetchPrice: (url, cancellable) => client.fetchPrice(url, cancellable),
             publish: view => { lastQuote = view.quote; this.indicator?.update(view, Date.now()); },
         });
-        this.idleMonitor = global.backend.get_core_idle_monitor();
-        this.idleWatch = this.idleMonitor.add_idle_watch(IDLE_PAUSE_MS, () => this.setIdle(true));
         this.controller.start();
-    }
-
-    private setIdle(idle: boolean): void {
-        if (!this.controller || !this.idleMonitor || this.idle === idle) return;
-        this.idle = idle;
-        if (idle) {
-            // Mutter's active watch is one-shot; it only needs removing if disable() comes first.
-            this.activeWatch = this.idleMonitor.add_user_active_watch(() => { this.activeWatch = 0; this.setIdle(false); });
-            this.controller.pause();
-        } else {
-            this.controller.resume();
-        }
+        // Event-driven: when the internet is reachable again, a failing price is read at once instead of
+        // after the backoff. Connectivity becomes full when a default route returns or NetworkManager's
+        // connectivity check passes again.
+        const monitor = Gio.NetworkMonitor.get_default();
+        this.networkMonitor = monitor;
+        this.networkChanged = monitor.connect('notify::connectivity', () => {
+            if (monitor.connectivity === Gio.NetworkConnectivity.FULL) this.controller?.retryIfFailing();
+        });
     }
 
     private openChart(): void {
         const cancellable = new Gio.Cancellable();
         this.launches.add(cancellable);
-        Gio.AppInfo.launch_default_for_uri_async(CHART_URL, null, cancellable, (_source, result) => {
+        // The launch context carries the activation token, as GNOME Shell's own launches do.
+        Gio.AppInfo.launch_default_for_uri_async(CHART_URL, global.create_app_launch_context(0, -1), cancellable, (_source, result) => {
             this.launches.delete(cancellable);
             try {
                 Gio.AppInfo.launch_default_for_uri_finish(result);
@@ -70,10 +63,9 @@ export default class BtcPriceExtension extends Extension {
     }
 
     override disable(): void {
-        for (const watch of [this.idleWatch, this.activeWatch]) if (watch) this.idleMonitor?.remove_watch(watch);
-        this.idleWatch = this.activeWatch = 0;
-        this.idleMonitor = null;
-        this.idle = false;
+        if (this.networkChanged) this.networkMonitor?.disconnect(this.networkChanged);
+        this.networkChanged = 0;
+        this.networkMonitor = null;
         this.controller?.stop();
         this.controller = null;
         this.client?.close();

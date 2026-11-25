@@ -21,7 +21,8 @@ BtcPriceExtension.prototype.enable = function () {
     if (!reportPath) return;
     if (extension.probed) {
         // A later enable is the runner's lock/unlock: record the panel at once and after the first read.
-        const panel = () => ({text: extension.indicator.label.get_text(), status: extension.indicator.status.label.get_text()});
+        const panel = () => ({text: extension.indicator.label.get_text(), source: extension.indicator.source.get_text(),
+            status: extension.indicator.status.get_text()});
         const atEnable = panel();
         void extension.controller.pending.then(() => probeWrite(reportPath + '.reenable', {atEnable, afterRead: panel()}));
         return;
@@ -33,7 +34,13 @@ BtcPriceExtension.prototype.enable = function () {
         (s, result) => { try { resolve(new TextDecoder().decode(s.send_and_read_finish(result).get_data())); } catch (error) { reject(error); } }));
     const pause = ms => new Promise(resolve => ProbeGLib.timeout_add(ProbeGLib.PRIORITY_DEFAULT, ms, () => { resolve(); return ProbeGLib.SOURCE_REMOVE; }));
     const label = () => extension.indicator.label;
-    const status = () => extension.indicator.status.label.get_text();
+    const card = () => ({text: label().get_text(), source: extension.indicator.source.get_text(), price: extension.indicator.price.get_text(),
+        status: extension.indicator.status.get_text(), opacity: extension.indicator.price.opacity, delay: delay()});
+    const findButton = (actor, text) => {
+        if (actor.label === text && typeof actor.get_label === 'function') return actor;
+        for (const child of actor.get_children()) { const found = findButton(child, text); if (found) return found; }
+        return null;
+    };
     const delay = () => {
         const source = ProbeGLib.MainContext.default().find_source_by_id(extension.controller.timer);
         return source ? (source.get_ready_time() - ProbeGLib.get_monotonic_time()) / 1e6 : null;
@@ -57,13 +64,27 @@ BtcPriceExtension.prototype.enable = function () {
             report.steady = [...texts];
             await control('coinbase=fail&binance=ok');
             await extension.controller.refresh();
-            report.fallback = {text: label().get_text(), status: status(), delay: delay()};
+            report.fallback = card();
             await control('coinbase=fail&binance=fail');
             await extension.controller.refresh();
-            report.allFail = {text: label().get_text(), status: status(), delay: delay()};
+            report.allFail = card();
             await control('coinbase=ok&binance=ok');
             await extension.controller.refresh();
-            report.recovered = {text: label().get_text(), status: status(), delay: delay()};
+            report.recovered = card();
+            extension.indicator.button.menu.open();
+            await pause(400);
+            // Refresh is a button inside the card: it reads at once and the menu stays open.
+            const before = JSON.parse(await control('report=1')).coinbase;
+            findButton(extension.indicator.button.menu.actor, 'Refresh').emit('clicked', 1);
+            await extension.controller.pending;
+            report.refreshButton = {open: extension.indicator.button.menu.isOpen, reads: JSON.parse(await control('report=1')).coinbase - before};
+            // The card must not inherit GNOME's dimmed inactive-item colour: its text matches the menu's own.
+            const rgba = actor => { const c = actor.get_theme_node().get_foreground_color(); return [c.red, c.green, c.blue, c.alpha].join(','); };
+            report.colors = {price: rgba(extension.indicator.price), menu: rgba(extension.indicator.button.menu.box)};
+            let charts = 0;
+            extension.openChart = () => { charts++; };
+            findButton(extension.indicator.button.menu.actor, 'TradingView chart ↗').emit('clicked', 1);
+            report.chartButton = {open: extension.indicator.button.menu.isOpen, charts};
             extension.indicator.button.menu.open();
             await pause(400);
             const menu = extension.indicator.button.menu.actor;

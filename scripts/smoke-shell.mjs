@@ -5,6 +5,7 @@ import {createServer} from 'node:http';
 import {mkdtemp, mkdir, readFile, appendFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join, resolve} from 'node:path';
+import {nextDelaySeconds} from '../build/price.js';
 
 const repo = resolve(import.meta.dirname, '..');
 if (process.argv[2] !== '--inner') {
@@ -80,18 +81,25 @@ try {
     for (let i = 0; i < 150 && !report; i++) { try { report = JSON.parse(await readFile(env.BTCPRICE_UI_REPORT, 'utf8')); } catch { await sleep(100); } }
     if (!report) fail('Probe report not produced', null);
     if (report.error) fail('Probe failed', report.error);
-    if (report.first !== 'BTC $61,764' || !near(report.firstDelay, 15)) fail('First Coinbase price or 15 s schedule missing', report);
+    const [healthy, backoff] = [nextDelaySeconds(0), nextDelaySeconds(1)];
+    if (report.first !== 'BTC $61,764' || !near(report.firstDelay, healthy)) fail(`First Coinbase price or ${healthy} s schedule missing`, report);
     if (Math.max(...report.widths) - Math.min(...report.widths) > 0.5) fail('Digits are not tabular; the panel would shift', report.widths);
     if (report.steady.length !== 1 || report.steady[0] !== 'BTC $61,764') fail('Panel text changed during a refresh', report.steady);
-    if (report.fallback.text !== 'BTC 61,770 USDT' || !report.fallback.status.startsWith('Binance') || !near(report.fallback.delay, 15))
+    if (report.fallback.text !== 'BTC 61,770 USDT' || report.fallback.source !== 'Binance' || report.fallback.price !== '61,770.30 USDT'
+        || !report.fallback.status.startsWith('Coinbase 응답 없음') || !near(report.fallback.delay, healthy))
         fail('Binance fallback not shown', report.fallback);
-    if (report.allFail.text !== 'BTC ~61,770 USDT' || !report.allFail.status.includes('재시도') || !near(report.allFail.delay, 30))
-        fail('Total failure must keep the last price marked not live and back off to 30 s', report.allFail);
-    if (report.recovered.text !== 'BTC $61,764' || !report.recovered.status.startsWith('Coinbase') || !near(report.recovered.delay, 15))
-        fail('Recovery to Coinbase and 15 s failed', report.recovered);
+    if (report.allFail.text !== 'BTC ~61,770 USDT' || !report.allFail.status.includes('재시도') || !near(report.allFail.delay, backoff))
+        fail(`Total failure must keep the last price marked not live and back off to ${backoff} s`, report.allFail);
+    if (report.recovered.text !== 'BTC $61,764' || report.recovered.source !== 'Coinbase' || report.recovered.price !== '$61,763.77'
+        || report.recovered.status.includes('재시도') || !near(report.recovered.delay, healthy))
+        fail(`Recovery to Coinbase and ${healthy} s failed`, report.recovered);
+    if (!report.refreshButton.open || report.refreshButton.reads !== 1) fail('Refresh must read once and keep the menu open', report.refreshButton);
+    if (report.chartButton.open || report.chartButton.charts !== 1) fail('The chart button must close the menu and open the chart once', report.chartButton);
+    if (report.colors.price !== report.colors.menu) fail('The menu card text is dimmed', report.colors);
+    if (report.allFail.opacity >= 255 || report.recovered.opacity !== 255) fail('Only a price that is not live is dimmed in the menu', [report.allFail, report.recovered]);
     if (report.menu.x < 0 || report.menu.x + report.menu.width > report.menu.stageWidth + 1) fail('Menu overflows the screen', report.menu);
-    // first + width restore + steady + fallback + all-fail + recovery reads; Binance only on Coinbase failure.
-    if (report.counts.coinbase !== 6 || report.counts.binance !== 2) fail('Unexpected request counts', report.counts);
+    // first + width restore + steady + fallback + all-fail + recovery + Refresh button reads; Binance only on Coinbase failure.
+    if (report.counts.coinbase !== 7 || report.counts.binance !== 2) fail('Unexpected request counts', report.counts);
     const errors = call('org.gnome.Shell.Extensions.GetExtensionErrors', meta.uuid);
     if (!/\(\[\]|@as \[\]/.test(errors)) fail('Extension errors', errors);
     call('org.gnome.Shell.Extensions.DisableExtension', meta.uuid);
@@ -104,13 +112,13 @@ try {
     let unlock = null;
     for (let i = 0; i < 50 && !unlock; i++) { try { unlock = JSON.parse(await readFile(env.BTCPRICE_UI_REPORT + '.reenable', 'utf8')); } catch { await sleep(100); } }
     if (unlock?.atEnable.text !== 'BTC $61,764' || unlock.afterRead.text !== 'BTC ~$61,764'
-        || !unlock.afterRead.status.startsWith('Coinbase') || !unlock.afterRead.status.includes('재시도'))
+        || unlock.afterRead.source !== 'Coinbase' || !unlock.afterRead.status.includes('재시도'))
         fail('After an offline unlock the last price must stay, marked not live', unlock);
     const after = call('org.gnome.Shell.Extensions.GetExtensionErrors', meta.uuid);
     if (!/\(\[\]|@as \[\]/.test(after)) fail('Re-enable errors', after);
     if (counts.coinbase !== afterDisable.coinbase + 1 || counts.binance !== afterDisable.binance + 1)
         fail('Re-enable should read Coinbase once, then Binance once', counts);
-    console.log(`Panel ${report.first} (tabular widths ${report.widths.map(Math.round).join('/')}px), steady during refresh, fallback "${report.fallback.text}", all-fail backoff ${Math.round(report.allFail.delay)}s, recovery 15s, menu ${Math.round(report.menu.width)}x${Math.round(report.menu.height)}`);
+    console.log(`Panel ${report.first} (tabular widths ${report.widths.map(Math.round).join('/')}px), steady during refresh, fallback "${report.fallback.text}", all-fail backoff ${Math.round(report.allFail.delay)}s, recovery ${healthy}s, menu price "${report.recovered.price}", Refresh kept the menu open, menu ${Math.round(report.menu.width)}x${Math.round(report.menu.height)}`);
     console.log(`Offline unlock keeps "${unlock.afterRead.text}" (${unlock.afterRead.status})`);
     console.log('Isolated GNOME Shell smoke passed: Coinbase first, Binance fallback, backoff, steady tabular panel, no requests after disable, offline unlock keeps the last price.');
 } catch (error) {

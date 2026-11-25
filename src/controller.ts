@@ -17,7 +17,6 @@ export class PriceController {
     private failures = 0;
     private failing = new Set<string>();
     private active = false;
-    private paused = false;
     private generation = 0;
     private timer = 0;
     private pending: Promise<void> | null = null;
@@ -32,7 +31,7 @@ export class PriceController {
         this.active = true;
         this.generation++;
         if (this.quote) this.publish();
-        if (!this.paused) void this.refresh();
+        void this.refresh();
     }
 
     refresh(): Promise<void> {
@@ -46,7 +45,7 @@ export class PriceController {
             if (generation !== this.generation) return;
             this.pending = null;
             this.cancel = null;
-            if (this.active && !this.paused) this.schedule();
+            if (this.active) this.schedule();
         });
         return this.pending;
     }
@@ -86,21 +85,13 @@ export class PriceController {
     }
 
     private publish(): void {
-        this.options.publish({quote: this.quote, failing: this.failures > 0, paused: this.paused});
+        this.options.publish({quote: this.quote, failing: this.failures > 0});
     }
 
-    /** While the user is away nobody reads the panel: stop polling and mark the price as not live. */
-    pause(): void {
-        if (this.paused) return;
-        this.paused = true;
-        if (this.timer) { GLib.Source.remove(this.timer); this.timer = 0; }
-        if (this.active) this.publish();
-    }
-
-    resume(): void {
-        if (!this.paused) return;
-        this.paused = false;
-        void this.refresh();
+    /** The network came back: read at once instead of waiting out the failure backoff (up to a minute).
+     * Healthy polling ignores it, so frequent network notifications cost nothing. */
+    retryIfFailing(): void {
+        if (this.failures > 0) void this.refresh();
     }
 
     stop(): void {
